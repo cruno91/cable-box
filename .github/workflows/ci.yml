@@ -1,0 +1,118 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * 1" # keep away from midnight America/New_York: poc:W00c asserts a midnight-today start
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  go:
+    name: go vet / test / race
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "::error::gofmt needed:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  fuzz:
+    name: go fuzz (pathmap)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - run: go test -run='^$' -fuzz=FuzzMapNeverEscapes -fuzztime=60s ./internal/pathmap
+
+  lint:
+    name: shell / python / docs / pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: shellcheck
+        run: shellcheck -S warning test/integration/fs42/*.sh
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13" # Pi OS trixie system Python
+      - name: probe compiles
+        run: python -m py_compile internal/fs42/probe/fs42probe.py
+      - name: FS42 pin agrees between Makefile and Dockerfile
+        run: |
+          mk=$(sed -nE 's/^FS42_SHA[[:space:]]*:=[[:space:]]*([0-9a-f]{40}).*/\1/p' Makefile)
+          df=$(sed -nE 's/^ARG FS42_SHA=([0-9a-f]{40}).*/\1/p' test/integration/fs42/Dockerfile)
+          echo "Makefile=$mk Dockerfile=$df"
+          [ -n "$mk" ] && [ "$mk" = "$df" ]
+      - name: docs links (offline, case-sensitive, anchors)
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --offline --include-fragments --no-progress './**/*.md'
+          fail: true
+
+  fs42-sandbox:
+    name: FS42 sandbox (arm64)
+    needs: [go, lint]
+    # private repos: set the FS42_SANDBOX_RUNNER variable to an arm64 runner label
+    runs-on: ${{ vars.FS42_SANDBOX_RUNNER || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: img
+        run: echo "tag=$(make -s sandbox-image-name)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: build pinned sandbox image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: test/integration/fs42
+          platforms: linux/arm64
+          load: true
+          tags: ${{ steps.img.outputs.tag }}
+          cache-from: type=gha,scope=fs42-sandbox
+          cache-to: type=gha,scope=fs42-sandbox,mode=max
+      - name: synthetic NAS fixtures
+        run: make fixtures NO_BUILD=1
+      - name: upstream pytest at pin
+        run: make wp0-upstream-tests NO_BUILD=1
+      - name: two-channel shared-symlink PoC
+        run: make wp0-poc NO_BUILD=1
+      - name: activation / rollback
+        if: ${{ !cancelled() }}
+        run: make wp0-activation NO_BUILD=1
+      - name: summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "### FS42 sandbox (pinned $(sed -nE 's/^FS42_SHA[[:space:]]*:=[[:space:]]*([0-9a-f]{7}).*/\1/p' Makefile))"
+            for s in poc activation; do
+              f=.work/evidence/$s/results.txt
+              [ -f "$f" ] || continue
+              echo "**$s:** $(grep -c '^PASS' "$f") passed, $(grep -c '^FAIL' "$f") failed"
+              grep '^FAIL' "$f" | sed 's/^/- /' || true
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wp0-evidence
+          path: .work/evidence/
+          retention-days: 14

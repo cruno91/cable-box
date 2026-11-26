@@ -1,0 +1,20 @@
+# local scratch / sandboxes
+.idea
+.work/
+/bin/
+/dist/
+*.test
+coverage.out
+# never commit media or runtime DBs
+*.mp4
+*.mkv
+*.db
+*.db-wal
+*.db-shm
+# env / secrets
+.env
+*.local.env
+
+# python bytecode
+__pycache__/
+*.pyc
